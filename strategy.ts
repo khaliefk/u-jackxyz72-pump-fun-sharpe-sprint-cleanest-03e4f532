@@ -61,20 +61,20 @@ export const DEFAULT_PARAMS: SharpsParams = {
   minBuySol: 0.02,
   buySlipBps: 300,
   window: 10,
-  minNetSol: 0.5,
-  minBuys: 7,
+  minNetSol: 1.0,
+  minBuys: 9,
   minBuyers: 4,
   maxBuyerShare: 0.5,
   minPriceUp: 0.02,
-  maxPriceUp: 0.6,
+  maxPriceUp: 0.35,
   nearHigh: 0.97,
   minRealSol: 1,
   maxRealSol: 80,
   minAgeSlots: 30,
   maxEntries: 2,
   cooldownSlots: 500,
-  takeProfit: 1.09,
-  stopLoss: 0.9,
+  takeProfit: 1.07,
+  stopLoss: 0.92,
   trailArm: 1.1,
   trailGiveback: 0.9,
   maxHoldSlots: 400,
@@ -283,6 +283,13 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
       if (curve === undefined || curve.complete) continue;
       if (lamportsToSol(curve.real_quote_reserves) < p.probeMinRealSol) continue;
       if (tape.trades.length < p.window) continue;
+      // Probe only when the newer half of the window is still buying:
+      // a busy tape that has already rolled over is not a fresh sprint.
+      const win = tape.trades.slice(tape.trades.length - p.window);
+      const half = Math.floor(p.window / 2);
+      let newerNet = 0;
+      for (let i = half; i < win.length; i += 1) newerNet += win[i].buy ? win[i].sol : -win[i].sol;
+      if (newerNet <= 0) continue;
       if (tape.trades.length > bestTrades) {
         bestTrades = tape.trades.length;
         best = mint;
