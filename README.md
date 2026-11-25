@@ -4,30 +4,28 @@
 
 # Steady-Hands Momentum Bot
 
-Paper-trading bot for the [Pump.fun Sharpe Sprint](https://make.fun/bounty/u-jackxyz72-pump-fun-sharpe-sprint-cleanest-03e4f532) on make.fun: a 6-hour pump.fun replay ranked by hourly Sharpe ratio, not wildest PnL.
+A paper-trading bot for the [Pump.fun Sharpe Sprint](https://make.fun/bounty/u-jackxyz72-pump-fun-sharpe-sprint-cleanest-03e4f532) on make.fun — a 6-hour pump.fun replay scored by hourly Sharpe ratio, where steady wins beat one lucky moonshot.
 
-## How it trades
+## Idea
 
-Most pump.fun curves bleed out; a minority sprint. The bot only buys a sprint already in progress:
+Most pump.fun curves bleed out and only a few sprint. This bot waits for a sprint that is already underway, then rides it briefly:
 
-- several distinct wallets buying, net SOL flowing in over the last 15 trades, with the newer half still buying;
-- price up 3–60% from the window start, sitting near the window high (no chasing vertical moves);
-- no single buyer dominating, real SOL reserves between 1 and 80.
+- at least 4 distinct buyers and 9 buys in the last 10 trades, with net SOL above 1.0 and the newer half of the window still buying;
+- price up 2–35% from the window start and holding near the window high, so it never chases a vertical move;
+- no single buyer taking more than half of the buy volume, and real SOL reserves between 1 and 80.
 
-Then it gets out fast: +9% take-profit, −10% stop-loss, a trailing stop once a trade is 10% green, and a hard 600-slot time limit so dead money never sits. Each position targets 0.4 SOL (capped at 1% of the curve's real reserves), at most 5 open at once.
-
-Small, repeatable wins with capped losses is what an hourly Sharpe ratio rewards.
+It exits fast: +7% take-profit, −8% stop-loss, a trailing stop once a trade is 10% green, and a hard 400-slot time limit. Each bet is 0.4 SOL, at most 5 positions open at once.
 
 ## Guardrails
 
-- At least 20 distinct mints with round trips of 0.01 SOL or more: if the bot's own round trips lag, it runs tiny 0.02 SOL probe trades on the busiest liquid curve and exits them quickly.
-- Max drawdown is kept far under the 50% cap by the tight stops and small stakes.
-- Fully deterministic: no clock, no environment reads, no randomness. Two runs produce byte-identical action logs.
+- 20 distinct mints with round trips of at least 0.01 SOL: when the bot's own round trips fall short, it sends tiny 0.02 SOL probe trades on the busiest liquid curve whose newer tape half is still buying, and exits them quickly.
+- Drawdown stays far below the 50% cap thanks to the tight stops and small stakes.
+- Fully deterministic — no clock, no environment reads, no randomness — so two runs produce byte-identical action logs.
 
-## Layout
+## Files
 
 - `main.ts` — entry point, run by the grader as `node /bot/main.ts`
-- `strategy.ts` — the strategy (entry filters, exits, probes)
+- `strategy.ts` — entry filters, exits, and probes
 - `vendor/makefun-bot.ts` — the kit's replay shim, vendored byte-identical
 
 ## License

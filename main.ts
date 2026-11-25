@@ -1,8 +1,10 @@
-// Pump.fun Sharpe Sprint — Cleanest Paper Bot Wins.
-// Entry point: the grader runs `node /bot/main.ts` (Node 22 strips types).
-// The strategy lives in strategy.ts; the wire shim is vendored unchanged.
+// Pump.fun Sharpe Sprint — cleanest paper bot wins.
+// The grader starts here with `node /bot/main.ts` on Node 22, which strips
+// types on the fly. All trading logic lives in strategy.ts; the replay
+// shim under vendor/ is the kit's, byte-identical.
 
-import { runBot } from './vendor/makefun-bot.ts';
-import { createSharpeBot } from './strategy.ts';
+import { runBot } from "./vendor/makefun-bot.ts";
+import { createSharpeBot } from "./strategy.ts";
 
-await runBot(createSharpeBot());
+const bot = createSharpeBot();
+await runBot(bot);

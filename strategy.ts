@@ -1,16 +1,16 @@
 // Steady-hands momentum bot for the pump.fun Sharpe sprint.
 //
-// Most pump.fun curves bleed out; a minority sprint. This bot only buys a
-// sprint already in progress (several distinct wallets buying, net SOL
-// flowing in, price climbing but not yet vertical), sizes each bet small
-// against a 10 SOL bankroll, and gets out fast: a modest take-profit, a
-// tight stop, a trailing stop once a trade is green, and a hard time limit
-// so dead money never sits. Small, repeatable wins with capped losses is
-// what an hourly Sharpe ratio rewards, not one moonshot.
+// Most pump.fun curves bleed out; only a few sprint. This bot buys a
+// sprint that is already underway — several distinct wallets buying, net
+// SOL flowing in, price climbing but not yet vertical — bets small against
+// a 10 SOL bankroll, and gets out fast: a modest take-profit, a tight
+// stop, a trailing stop once a trade is green, and a hard time limit so
+// dead money never sits. Small repeatable wins with capped losses are
+// what an hourly Sharpe ratio rewards, not a single moonshot.
 //
-// Guardrail insurance: if the bot's own round trips lag, it runs tiny
+// Guardrail insurance: when the bot's own round trips lag, it runs tiny
 // probe trades (0.02 SOL) on the most active liquid curve and exits them
-// quickly, so the 20-distinct-mints bar is met even on a quiet window.
+// quickly, so the 20-distinct-mints bar is met even in a quiet window.
 //
 // Deterministic by construction: no clock, no environment reads, no
 // Math.random; every loop walks insertion-ordered maps fed by the batch
@@ -21,12 +21,12 @@ import type {
   BotState,
   OrderInput,
   Pubkey,
-} from './vendor/makefun-bot.ts';
-import { LAMPORTS_PER_SOL } from './vendor/makefun-bot.ts';
+} from "./vendor/makefun-bot.ts";
+import { LAMPORTS_PER_SOL } from "./vendor/makefun-bot.ts";
 
-const SOL = 1e9; // lamports per SOL, as a number for tape math
+const SOL_LAMPORTS = 1e9; // lamports per SOL, as a number for tape math
 
-export interface SharpsParams {
+export interface BotParams {
   // sizing
   stakeSol: number;
   minBuySol: number;
@@ -56,7 +56,7 @@ export interface SharpsParams {
   probeMinRealSol: number;
 }
 
-export const DEFAULT_PARAMS: SharpsParams = {
+export const DEFAULTS: BotParams = {
   stakeSol: 0.4,
   minBuySol: 0.02,
   buySlipBps: 300,
@@ -82,13 +82,13 @@ export const DEFAULT_PARAMS: SharpsParams = {
   probeMinRealSol: 5,
 };
 
-const TAPE_KEEP = 40;
-const PRUNE_AFTER_SLOTS = 30_000;
-const PROBE_TAKE = 1.04;
-const PROBE_STOP = 0.96;
-const PROBE_MAX_HOLD_SLOTS = 800;
+const MAX_TAPE = 40;
+const STALE_AFTER_SLOTS = 30_000;
+const PROBE_TP = 1.04;
+const PROBE_SL = 0.96;
+const PROBE_MAX_HOLD = 800;
 
-interface TapeTrade {
+interface TapeEntry {
   slot: number;
   buy: boolean;
   sol: number;
@@ -96,15 +96,15 @@ interface TapeTrade {
   price: number;
 }
 
-interface Tape {
+interface CurveTape {
   createdSlot: number;
-  trades: TapeTrade[];
+  trades: TapeEntry[];
   entries: number;
   cooldownUntil: number;
   lastSeenSlot: number;
 }
 
-interface Held {
+interface Position {
   cost: bigint;
   tokens: bigint;
   entrySlot: number;
@@ -112,7 +112,7 @@ interface Held {
   probe: boolean;
 }
 
-function priceOf(state: BotState, mint: Pubkey, tape: Tape | undefined): number {
+function quotePrice(state: BotState, mint: Pubkey, tape: CurveTape | undefined): number {
   const curve = state.curves.get(mint);
   if (curve !== undefined && curve.virtual_token_reserves > 0n) {
     return Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
@@ -122,19 +122,19 @@ function priceOf(state: BotState, mint: Pubkey, tape: Tape | undefined): number 
   return 0;
 }
 
-function lamportsToSol(n: bigint): number {
-  return Number(n) / SOL;
+function toSol(n: bigint): number {
+  return Number(n) / SOL_LAMPORTS;
 }
 
-export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
+export function createSharpeBot(overrides: Partial<BotParams> = {}): {
   onBatch(state: BotState, batch: Batch): OrderInput[];
 } {
-  const p: SharpsParams = { ...DEFAULT_PARAMS, ...overrides };
-  const stakeLamports = BigInt(Math.round(p.stakeSol * SOL));
-  const minBuyLamports = BigInt(Math.round(p.minBuySol * SOL));
+  const p: BotParams = { ...DEFAULTS, ...overrides };
+  const stakeLamports = BigInt(Math.round(p.stakeSol * SOL_LAMPORTS));
+  const minBuyLamports = BigInt(Math.round(p.minBuySol * SOL_LAMPORTS));
 
-  const tapes = new Map<Pubkey, Tape>();
-  const held = new Map<Pubkey, Held>();
+  const tapes = new Map<Pubkey, CurveTape>();
+  const held = new Map<Pubkey, Position>();
   /** Mints with a filled buy of at least minBuySol. */
   const bought = new Set<Pubkey>();
   /** Mints with a completed round trip (buy then sell, both filled). */
@@ -142,7 +142,7 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
   /** One probe at a time, by mint. */
   const probes = new Set<Pubkey>();
 
-  function tapeOf(mint: Pubkey, slot: number): Tape {
+  function getTape(mint: Pubkey, slot: number): CurveTape {
     let tape = tapes.get(mint);
     if (tape === undefined) {
       tape = {
@@ -157,15 +157,15 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
     return tape;
   }
 
-  function foldFills(state: BotState, batch: Batch): void {
+  function applyFills(state: BotState, batch: Batch): void {
     for (const fill of batch.fills) {
-      if (fill.status !== 'filled') {
+      if (fill.status !== "filled") {
         // A probe buy that never filled frees the single-probe slot.
-        if (fill.side === 'buy') probes.delete(fill.mint);
+        if (fill.side === "buy") probes.delete(fill.mint);
         continue;
       }
       const mint = fill.mint;
-      if (fill.side === 'buy') {
+      if (fill.side === "buy") {
         const quote = BigInt(fill.quote_lamports);
         if (quote >= minBuyLamports) bought.add(mint);
         const prev = held.get(mint);
@@ -191,7 +191,7 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
     }
   }
 
-  function windowStats(tape: Tape): {
+  function windowSummary(tape: CurveTape): {
     netSol: number;
     buys: number;
     buyers: Set<string>;
@@ -226,54 +226,60 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
     return { netSol, buys, buyers, buySol, maxBuyerSol, startPrice: win[0].price, highPrice };
   }
 
-  function entrySignal(state: BotState, mint: Pubkey, tape: Tape): boolean {
+  // Net SOL of the newer half of the window: positive means the sprint
+  // is still accelerating, not already rolled over.
+  function newerHalfNet(tape: CurveTape): number {
+    const win = tape.trades.slice(tape.trades.length - p.window);
+    const half = Math.floor(p.window / 2);
+    let net = 0;
+    for (let i = half; i < win.length; i += 1) net += win[i].buy ? win[i].sol : -win[i].sol;
+    return net;
+  }
+
+  function shouldEnter(state: BotState, mint: Pubkey, tape: CurveTape): boolean {
     if (tape.entries >= p.maxEntries) return false;
     if (state.slot < tape.cooldownUntil) return false;
     if (state.slot - tape.createdSlot < p.minAgeSlots) return false;
     const curve = state.curves.get(mint);
     if (curve === undefined || curve.complete) return false;
-    const realSol = lamportsToSol(curve.real_quote_reserves);
+    const realSol = toSol(curve.real_quote_reserves);
     if (realSol < p.minRealSol || realSol > p.maxRealSol) return false;
-    const stats = windowStats(tape);
-    if (stats === null) return false;
-    if (stats.netSol < p.minNetSol) return false;
-    if (stats.buys < p.minBuys) return false;
-    if (stats.buyers.size < p.minBuyers) return false;
-    if (stats.buySol > 0 && stats.maxBuyerSol / stats.buySol > p.maxBuyerShare) return false;
-    const price = priceOf(state, mint, tape);
-    if (price <= 0 || stats.startPrice <= 0) return false;
-    const up = price / stats.startPrice - 1;
+    const s = windowSummary(tape);
+    if (s === null) return false;
+    if (s.netSol < p.minNetSol) return false;
+    if (s.buys < p.minBuys) return false;
+    if (s.buyers.size < p.minBuyers) return false;
+    if (s.buySol > 0 && s.maxBuyerSol / s.buySol > p.maxBuyerShare) return false;
+    const price = quotePrice(state, mint, tape);
+    if (price <= 0 || s.startPrice <= 0) return false;
+    const up = price / s.startPrice - 1;
     if (up < p.minPriceUp || up > p.maxPriceUp) return false;
-    if (stats.highPrice > 0 && price < p.nearHigh * stats.highPrice) return false;
+    if (s.highPrice > 0 && price < p.nearHigh * s.highPrice) return false;
     // Acceleration: the newer half of the window must still be buying.
-    const win = tape.trades.slice(tape.trades.length - p.window);
-    const half = Math.floor(p.window / 2);
-    let newerNet = 0;
-    for (let i = half; i < win.length; i += 1) newerNet += win[i].buy ? win[i].sol : -win[i].sol;
-    if (newerNet <= 0) return false;
+    if (newerHalfNet(tape) <= 0) return false;
     return true;
   }
 
-  function exitReason(state: BotState, mint: Pubkey, h: Held, tape: Tape | undefined): string | null {
-    const price = priceOf(state, mint, tape);
-    if (price <= 0 || h.cost <= 0n || h.tokens <= 0n) return 'no-price';
-    const valueSol = lamportsToSol(h.tokens) * price;
-    const costSol = lamportsToSol(h.cost);
+  function exitWhy(state: BotState, mint: Pubkey, h: Position, tape: CurveTape | undefined): string | null {
+    const price = quotePrice(state, mint, tape);
+    if (price <= 0 || h.cost <= 0n || h.tokens <= 0n) return "no-price";
+    const valueSol = toSol(h.tokens) * price;
+    const costSol = toSol(h.cost);
     const ratio = valueSol / costSol;
     if (ratio > h.peakRatio) h.peakRatio = ratio;
-    if (ratio >= p.takeProfit) return 'take-profit';
-    if (ratio <= p.stopLoss) return 'stop-loss';
-    if (h.peakRatio >= p.trailArm && ratio <= p.trailGiveback * h.peakRatio) return 'trailing-stop';
-    if (state.slot - h.entrySlot >= p.maxHoldSlots) return 'time-limit';
+    if (ratio >= p.takeProfit) return "take-profit";
+    if (ratio <= p.stopLoss) return "stop-loss";
+    if (h.peakRatio >= p.trailArm && ratio <= p.trailGiveback * h.peakRatio) return "trailing-stop";
+    if (state.slot - h.entrySlot >= p.maxHoldSlots) return "time-limit";
     if (h.probe) {
-      if (ratio >= PROBE_TAKE) return 'probe-take';
-      if (ratio <= PROBE_STOP) return 'probe-stop';
-      if (state.slot - h.entrySlot >= PROBE_MAX_HOLD_SLOTS) return 'probe-time';
+      if (ratio >= PROBE_TP) return "probe-take";
+      if (ratio <= PROBE_SL) return "probe-stop";
+      if (state.slot - h.entrySlot >= PROBE_MAX_HOLD) return "probe-time";
     }
     return null;
   }
 
-  function pickProbe(state: BotState): Pubkey | null {
+  function chooseProbe(state: BotState): Pubkey | null {
     let best: Pubkey | null = null;
     let bestTrades = 0;
     for (const [mint, tape] of tapes) {
@@ -281,15 +287,11 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
       if (state.slot < tape.cooldownUntil) continue;
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
-      if (lamportsToSol(curve.real_quote_reserves) < p.probeMinRealSol) continue;
+      if (toSol(curve.real_quote_reserves) < p.probeMinRealSol) continue;
       if (tape.trades.length < p.window) continue;
       // Probe only when the newer half of the window is still buying:
       // a busy tape that has already rolled over is not a fresh sprint.
-      const win = tape.trades.slice(tape.trades.length - p.window);
-      const half = Math.floor(p.window / 2);
-      let newerNet = 0;
-      for (let i = half; i < win.length; i += 1) newerNet += win[i].buy ? win[i].sol : -win[i].sol;
-      if (newerNet <= 0) continue;
+      if (newerHalfNet(tape) <= 0) continue;
       if (tape.trades.length > bestTrades) {
         bestTrades = tape.trades.length;
         best = mint;
@@ -298,36 +300,36 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
     return best;
   }
 
-  function prune(state: BotState): void {
+  function sweepStale(state: BotState): void {
     for (const [mint, tape] of tapes) {
       if (held.has(mint)) continue;
-      if (state.slot - tape.lastSeenSlot < PRUNE_AFTER_SLOTS) continue;
+      if (state.slot - tape.lastSeenSlot < STALE_AFTER_SLOTS) continue;
       tapes.delete(mint);
     }
   }
 
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
-      foldFills(state, batch);
+      applyFills(state, batch);
 
       // Fold this batch's events into the tapes.
       for (const e of batch.events) {
-        if (e.event === 'CreateEvent') {
-          const tape = tapeOf(e.mint, e.slot);
+        if (e.event === "CreateEvent") {
+          const tape = getTape(e.mint, e.slot);
           tape.createdSlot = e.slot;
           tape.lastSeenSlot = e.slot;
-        } else if (e.event === 'TradeEvent') {
-          const tape = tapeOf(e.mint, e.slot);
+        } else if (e.event === "TradeEvent") {
+          const tape = getTape(e.mint, e.slot);
           const price =
             Number(BigInt(e.virtual_quote_reserves)) / Number(BigInt(e.virtual_token_reserves));
           tape.trades.push({
             slot: e.slot,
             buy: e.is_buy,
-            sol: lamportsToSol(BigInt(e.sol_amount)),
+            sol: toSol(BigInt(e.sol_amount)),
             user: e.user,
             price,
           });
-          if (tape.trades.length > TAPE_KEEP) tape.trades.splice(0, tape.trades.length - TAPE_KEEP);
+          if (tape.trades.length > MAX_TAPE) tape.trades.splice(0, tape.trades.length - MAX_TAPE);
           tape.lastSeenSlot = e.slot;
         } else {
           const tape = tapes.get(e.mint);
@@ -335,7 +337,7 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
         }
       }
 
-      if (batch.seq % 1000 === 0) prune(state);
+      if (batch.seq % 1000 === 0) sweepStale(state);
 
       const orders: OrderInput[] = [];
       const maxOrders = state.hello.caps.max_orders_per_batch;
@@ -347,10 +349,10 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
         if (orders.length >= maxOrders) break;
         const pos = state.positions.get(mint);
         if (pos === undefined || pos.token_amount <= 0n) continue;
-        if ([...state.pending.values()].some((q) => q.order.mint === mint && q.order.side === 'sell')) continue;
-        const reason = exitReason(state, mint, h, tapes.get(mint));
+        if ([...state.pending.values()].some((q) => q.order.mint === mint && q.order.side === "sell")) continue;
+        const reason = exitWhy(state, mint, h, tapes.get(mint));
         if (reason === null) continue;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
+        orders.push({ side: "sell", mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
         free -= tx;
       }
 
@@ -358,17 +360,17 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
       let slots = state.hello.caps.max_open_positions - state.committedPositionCount();
       for (const e of batch.events) {
         if (orders.length >= maxOrders || slots <= 0) break;
-        if (e.event !== 'TradeEvent') continue;
+        if (e.event !== "TradeEvent") continue;
         const mint = e.mint;
         if (held.has(mint)) continue;
         const tape = tapes.get(mint);
         if (tape === undefined) continue;
-        if (!entrySignal(state, mint, tape)) continue;
+        if (!shouldEnter(state, mint, tape)) continue;
         const cap = state.maxBuyLamports(mint);
         if (cap < minBuyLamports) continue;
         const amount = cap < stakeLamports ? cap : stakeLamports;
         if (free < amount + tx) continue;
-        orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: p.buySlipBps });
+        orders.push({ side: "buy", mint, quote_lamports: amount, max_slippage_bps: p.buySlipBps });
         tape.entries += 1;
         free -= amount + tx;
         slots -= 1;
@@ -383,11 +385,11 @@ export function createSharpeBot(overrides: Partial<SharpsParams> = {}): {
         probes.size === 0 &&
         [...held.values()].every((h) => !h.probe)
       ) {
-        const mint = pickProbe(state);
+        const mint = chooseProbe(state);
         if (mint !== null) {
           const cap = state.maxBuyLamports(mint);
           if (cap >= minBuyLamports && free >= minBuyLamports + tx) {
-            orders.push({ side: 'buy', mint, quote_lamports: minBuyLamports, max_slippage_bps: p.buySlipBps });
+            orders.push({ side: "buy", mint, quote_lamports: minBuyLamports, max_slippage_bps: p.buySlipBps });
             probes.add(mint);
           }
         }
